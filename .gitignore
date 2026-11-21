@@ -2,3 +2,5 @@
 *.iml
 .omo/
 .opencode/
+.openidea/
+mcp/qodana-mcp/node_modules/

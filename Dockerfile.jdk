@@ -19,6 +19,8 @@ ARG JDTLS_VERSION=1.63.0
 ARG JDTLS_BUILD=202610191322
 ARG KTLINT_VERSION=1.8.0
 ARG CHECKSTYLE_VERSION=14.4.0
+# Qodana CLI, pinned GitHub release (checksums.txt verified at build time).
+ARG QODANA_VERSION=v2026.3.1
 
 USER opencode
 
@@ -73,6 +75,27 @@ RUN set -euo pipefail \
 	&& printf '#!/bin/sh\nj="$HOME/.sdkman/candidates/java/%s"\n[ -d "$j" ] || j="$HOME/.sdkman/candidates/java/current"\nexec "$j/bin/java" -jar "$HOME/.local/share/checkstyle-all.jar" "$@"\n' \
 		"$tool_ver" > "$HOME/.local/bin/checkstyle" \
 	&& chmod +x "$HOME/.local/bin/ktlint" "$HOME/.local/bin/checkstyle"
+
+# Install Qodana CLI (static Go binary, no JDK involved).
+RUN set -euo pipefail \
+	&& archive="$HOME/.local/share/qodana-cli.tar.gz" \
+	&& dest="$HOME/.local/share/qodana" \
+	&& mkdir -p "$HOME/.local/bin" "$dest" \
+	&& curl -fsSL -o "$archive" \
+		"https://github.com/JetBrains/qodana-cli/releases/download/${QODANA_VERSION}/qodana_linux_x86_64.tar.gz" \
+	&& sha="$(curl -fsSL \
+		"https://github.com/JetBrains/qodana-cli/releases/download/${QODANA_VERSION}/checksums.txt" \
+		| grep "  qodana_linux_x86_64.tar.gz$" | awk '{print $1}')" \
+	&& echo "$sha  $archive" | sha256sum --quiet -c - \
+	&& tar -tzf "$archive" qodana > /dev/null \
+	&& tar -xzf "$archive" -C "$dest" qodana \
+	&& chmod +x "$dest/qodana" \
+	&& ln -s "$dest/qodana" "$HOME/.local/bin/qodana" \
+	&& rm -f "$archive"
+
+# Bake the Qodana MCP server (stdio, Node ESM) with its npm dependencies.
+COPY --chown=opencode:opencode mcp/qodana-mcp /opt/qodana-mcp
+RUN cd /opt/qodana-mcp && npm install --omit=dev
 
 ENV PATH="/home/opencode/.local/bin:${PATH}"
 

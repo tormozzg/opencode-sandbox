@@ -160,7 +160,11 @@ keeps it.
   (https://github.com/Kotlin/kotlin-lsp), standalone build with its own
   bundled runtime (independent of the sdkman JDKs);
 * `ktlint` — Kotlin linter/formatter, wrapped to run on the last JDK;
-* `checkstyle` — Java linter, wrapped to run on the last JDK.
+* `checkstyle` — Java linter, wrapped to run on the last JDK;
+* `qodana` — JetBrains static analysis CLI (native mode), installed in
+  `~/.local/share/qodana`; the scan cache is shared across containers via
+  the host mount `~/opencode/sandbox/qodana`; the first run downloads the
+  IDE distribution (~2.5-3 GB).
 
 === Switching the default Java version
 
@@ -270,6 +274,57 @@ state — and to never silence a rule without explaining why.
 ----
 
 Run it in the TUI as `/lint`.
+
+
+== Qodana MCP
+
+The image ships a Qodana MCP server at `/opt/qodana-mcp` (node, SDK-based)
+that exposes two tools for deep semantic analysis:
+
+* `qodana_start_scan(project_dir, files?)` — starts a background scan and
+  returns `{scan_id, status:"started"}`. Idempotent: while a scan is
+  already active it returns that scan's id instead of starting a second
+  one.
+* `qodana_findings(scan_id?, files?)` — returns `"running"` while the scan
+  is in progress, or compact findings as `{file, line, severity, rule,
+  message}` once it completes. Without a `scan_id` it reports the last
+  completed scan. Raw SARIF is never returned and the findings list is
+  capped at 200 entries.
+
+Enable it in the HOST config `~/opencode/sandbox/config/opencode.jsonc`
+(the config lives outside this repo, add the entry manually):
+
+[source, jsonc]
+----
+{
+  "mcp": {
+    "qodana": {
+      "type": "local",
+      "command": ["node", "/opt/qodana-mcp/index.js"],
+      "enabled": true
+    }
+  }
+}
+----
+
+Behavior notes:
+
+* Runs the `qodana` CLI in native mode, so no docker is needed inside the
+  container.
+* The scan cache is shared across containers via the new oc-sand-stateful
+  mount `~/opencode/sandbox/qodana` (applies to newly created containers).
+* Each scan takes minutes — the first run downloads the full IDE
+  distribution (~2.5-3 GB).
+* Findings use a narrow profile: semantic checks only (probable bugs and
+  redundancy groups; there is no explicit unused/dead-code taxon in the
+  real v2026.3.1 taxa list), no style checks.
+* The analyzed project must be a git repository — qodana refuses
+  non-git projects with "No files to check".
+* Scan state persists on disk under `/home/opencode/.cache/qodana/scans/`,
+  so findings survive MCP server restarts.
+
+ktlint/checkstyle remain the fast style loop; Qodana is the
+deep-analysis layer on top of them.
 
 
 == Install as a command
