@@ -76,6 +76,17 @@ RUN set -euo pipefail \
 		"$tool_ver" > "$HOME/.local/bin/checkstyle" \
 	&& chmod +x "$HOME/.local/bin/ktlint" "$HOME/.local/bin/checkstyle"
 
+# Font stack for the Qodana IDE process: Gradle/Maven import renders the build
+# view, which loads the AWT/Swing font stack (native font libs) even in
+# headless mode. Without it the IDE dies in seconds with
+# "missing libfreetype.so.6". Package set matches the official
+# jetbrains/qodana-jvm-community image exactly.
+USER root
+RUN apt-get update && apt-get install --no-install-recommends -y \
+		libfreetype6 fontconfig fontconfig-config fonts-dejavu-core libfontconfig1 \
+	&& rm -rf /var/lib/apt/lists/*
+USER opencode
+
 # Install Qodana CLI (static Go binary, no JDK involved).
 RUN set -euo pipefail \
 	&& archive="$HOME/.local/share/qodana-cli.tar.gz" \

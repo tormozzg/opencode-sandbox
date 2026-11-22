@@ -164,7 +164,9 @@ keeps it.
 * `qodana` — JetBrains static analysis CLI (native mode), installed in
   `~/.local/share/qodana`; the scan cache is shared across containers via
   the host mount `~/opencode/sandbox/qodana`; the first run downloads the
-  IDE distribution (~2.5-3 GB).
+  IDE distribution (~2.5-3 GB); the image ships the font stack
+  (fontconfig/libfreetype/fonts-dejavu) the IDE needs for build-view
+  rendering even in headless mode.
 
 === Switching the default Java version
 
