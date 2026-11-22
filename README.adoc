@@ -340,6 +340,12 @@ Behavior notes:
   `download.jetbrains.com` to resolve the latest IDE version. Result:
   warm scans run with zero external DNS. Cold starts (no cached dist
   yet) still need DNS to download the ~2.5-3 GB distribution.
+* The IDE's saved project config lives inside the shared scan cache
+  (`<cache-dir>/.idea`) and is keyed by the cache dir only — not by the
+  scanned project. The MCP records the last scanned project and scrubs that
+  directory whenever the scanned project changes, so every project's scan
+  syncs its own build system (a project switch costs one re-sync; repeat
+  scans of the same project reuse the warm cache).
 * On a network that also blocks Maven Central, scans additionally report
   Maven model errors ("Plugin ... not found" on `pom.xml`) on top of the
   code findings — dependency resolution itself needs egress.

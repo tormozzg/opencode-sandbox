@@ -202,6 +202,52 @@ function startEndpointStub() {
   });
 }
 
+// --- Cross-project IDE-config scrub -----------------------------------------
+// The IDE's saved project config lives in the shared cache at
+// <CACHE_DIR>/.idea/ and is keyed by --cache-dir ONLY, not by project:
+// scanning project B after project A restores A's .idea into B, and the IDE
+// opens B as "already imported", silently skipping B's build-system sync
+// ("No source roots detected" — zero source-file findings; proven
+// bidirectionally Gradle→Maven→Gradle in .opencode/evidence/silent-planet/
+// idea-cache-fix/ — font-libs proved the mechanism only). To keep each scan's project
+// context correct we persist the LAST scanned project_dir in
+// last-project.json on the shared mount (survives server restarts), and when
+// it differs from the project now being scanned delete <CACHE_DIR>/.idea
+// before spawning (a first-ever scan counts as a switch: if .idea does not
+// exist the removal is a no-op, but the marker is still recorded so a later
+// project switch triggers a scrub).
+// The scrub forces one build-system re-sync per project switch — the honest
+// trade-off for correctness; the IDE's warm inspection caches elsewhere in
+// the same cache dir stay, so repeat scans of the SAME project remain fast.
+// Scans are serialized by the running-scan check in startScan, so the scrub
+// never races a live scan of another project (the pre-existing TOCTOU window
+// in that check is unaffected here).
+
+const LAST_PROJECT_FILE = path.join(QODANA_ROOT, 'last-project.json');
+
+function scrubStaleIdeaCache(projectDir) {
+  let last = null;
+  try {
+    last = JSON.parse(fs.readFileSync(LAST_PROJECT_FILE, 'utf8')).project_dir ?? null;
+  } catch {
+    last = null; // no marker yet (first-ever scan) or unreadable: assume a switch
+  }
+  if (last === projectDir) return;
+  const ideaDir = path.join(CACHE_DIR, '.idea');
+  if (fs.existsSync(ideaDir)) {
+    fs.rmSync(ideaDir, { recursive: true });
+    console.error(`qodana-mcp: scrubbed stale IDE project config ${ideaDir} (last scanned: ${last ?? 'none'})`);
+  }
+  try {
+    fs.mkdirSync(QODANA_ROOT, { recursive: true });
+    fs.writeFileSync(LAST_PROJECT_FILE, JSON.stringify({ project_dir: projectDir }));
+  } catch (err) {
+    // Best-effort: a missed marker write only costs one redundant scrub next
+    // time — never fail the scan over it.
+    console.error(`qodana-mcp: could not write ${LAST_PROJECT_FILE}: ${err.message}`);
+  }
+}
+
 // --- Tool: qodana_start_scan -------------------------------------------------
 
 async function startScan(args) {
@@ -231,6 +277,17 @@ async function startScan(args) {
   }
   stub.unref();
   console.error(`qodana-mcp: endpoint stub listening at 127.0.0.1:${stub.address().port} (QODANA_ENDPOINT)`);
+
+  // AFTER the stub (the only await that can fail — no cache side effects may
+  // precede it) and BEFORE any scan-state creation or the spawn. On a scrub
+  // I/O failure close the stub (mirroring the child handlers) so the throw
+  // cannot leak the listener; marker-write failure-safety stays best-effort.
+  try {
+    scrubStaleIdeaCache(projectDir);
+  } catch (err) {
+    stub.close();
+    return toolError(`could not scrub stale IDE project config: ${err.message}`);
+  }
 
   const id = scanId();
   const scanDir = path.join(SCANS_DIR, id);
