@@ -322,6 +322,25 @@ Behavior notes:
   non-git projects with "No files to check".
 * Scan state persists on disk under `/home/opencode/.cache/qodana/scans/`,
   so findings survive MCP server restarts.
+* Scans resolve Qodana API endpoints against a local stub served by the
+  MCP server itself (via the official `QODANA_ENDPOINT` env var) —
+  qodana.cloud is IP-fenced for this user's network (HTTP 451 "Customer
+  Sanctions Notice").
+* This is a deliberate user decision recorded 2026-11-21: the user holds
+  purchased JetBrains licenses, but JetBrains withdrew cloud service from
+  the region.
+* The stub only answers endpoint resolution: no `QODANA_TOKEN` is set, no
+  cloud features are used, and no data leaves the machine except the
+  endpoint request to the local stub.
+* With a warm scan cache the MCP also pins `QODANA_DIST` (official qodana
+  CLI env var) to the already-extracted IDE distribution, which removes
+  the CLI's remaining external call at scan start — a HEAD request to
+  `download.jetbrains.com` to resolve the latest IDE version. Result:
+  warm scans run with zero external DNS. Cold starts (no cached dist
+  yet) still need DNS to download the ~2.5-3 GB distribution.
+* On a network that also blocks Maven Central, scans additionally report
+  Maven model errors ("Plugin ... not found" on `pom.xml`) on top of the
+  code findings — dependency resolution itself needs egress.
 
 ktlint/checkstyle remain the fast style loop; Qodana is the
 deep-analysis layer on top of them.

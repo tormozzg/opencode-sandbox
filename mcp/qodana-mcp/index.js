@@ -6,6 +6,7 @@
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -27,6 +28,36 @@ const SCANS_DIR = path.join(QODANA_ROOT, 'scans');
 const CACHE_DIR = path.join(QODANA_ROOT, 'cache', 'current');
 const LINTER = 'qodana-jvm-community';
 const MAX_FINDINGS = 200;
+
+// No-DNS hardening: in native mode the CLI resolves the IDE version via a feed
+// HEAD to https://download.jetbrains.com/qodana/feed/<linter>.releases.json
+// before EVERY scan (installers.go getIde -> getProductByLinterName), even when
+// the dist is already warm in the cache. There is no --linter version pin
+// (FindLinterByName matches bare names only; "name:version" is rejected). The
+// official bypass is QODANA_DIST pointing at the extracted IDE home
+// (PathNativeAnalyzer, DownloadDist()==false -> the feed call never happens).
+// The warm dist dir is created by the CLI itself: downloadAndInstallIDE
+// installs to Dir(Dir(--cache-dir))/<download-name-without-.gz>, which keeps a
+// trailing ".tar" — so the directory is reused in place when present; cold
+// starts (dist not yet downloaded, DNS needed) are left untouched.
+const WARM_DIST_PREFIX = 'qodana-QDJVMC-'; // product code of qodana-jvm-community
+
+function findWarmDist() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(QODANA_ROOT, { withFileTypes: true });
+  } catch {
+    return null; // QODANA_ROOT not created yet: cold start
+  }
+  const dist = entries.find(
+    (entry) => entry.isDirectory() && entry.name.startsWith(WARM_DIST_PREFIX) && entry.name.endsWith('.tar'),
+  );
+  if (!dist) return null;
+  const distPath = path.join(QODANA_ROOT, dist.name);
+  // The CLI fatals if QODANA_DIST is not a valid dist: only reuse a complete one.
+  if (!fs.existsSync(path.join(distPath, 'product-info.json'))) return null;
+  return distPath;
+}
 
 // Inspection groups for the narrow semantic profile. CONFIRMED 2026-11-21
 // against v2026.3.1 SARIF (real scan, qodana-jvm-community): inspection groups
@@ -133,9 +164,47 @@ function isPidAlive(pid) {
   }
 }
 
+// --- Local endpoint stub (JetBrains IP-fencing workaround) -------------------
+// The qodana CLI hard-requires https://qodana.cloud/api/versions before any
+// scan, but qodana.cloud is IP-fenced for this user's network (HTTP 451
+// "Customer Sanctions Notice" — JetBrains withdrew service from the region;
+// user decision recorded 2026-11-21 in the purchased-license context). The
+// official QODANA_ENDPOINT env var (per Qodana docs) redirects the CLI to a
+// replacement host, so each scan gets an in-process stub server on an
+// ephemeral 127.0.0.1 port serving the one endpoint the CLI resolves — the
+// /api/versions payload reconstructed from qodana-cli v2026.3.1
+// internal/cloud/versions.go (needs api major 1 + minor >= 0; community +
+// no-token scans never fetch the URLs and make no further cloud calls).
+// The stub only answers endpoint resolution: no token is set, no cloud
+// features are touched, and nothing leaves the machine except this request
+// to localhost. The stub lives in the MCP process; if the MCP server dies
+// mid-scan the child fails its endpoint call and reconcile() finalizes the
+// scan as failed. Any other path gets 404 — the drivers show the CLI probes
+// only /api/versions.
+
+function startEndpointStub() {
+  return new Promise((resolve, reject) => {
+    const stub = http.createServer((req, res) => {
+      if (req.url === '/api/versions') {
+        const { port } = stub.address();
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          api: { versions: [{ version: '1.0', url: `http://127.0.0.1:${port}/api` }] },
+          linters: { versions: [{ version: '1.0', url: `http://127.0.0.1:${port}/linters/api` }] },
+        }));
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+    stub.on('error', reject);
+    stub.listen(0, '127.0.0.1', () => resolve(stub));
+  });
+}
+
 // --- Tool: qodana_start_scan -------------------------------------------------
 
-function startScan(args) {
+async function startScan(args) {
   const invalid = validateStartScanArgs(args);
   if (invalid) return toolError(invalid);
 
@@ -149,17 +218,47 @@ function startScan(args) {
     return json({ scan_id: path.basename(running), status: 'running', already_running: true });
   }
 
+  // Start the stub BEFORE creating any scan state: if it fails to listen,
+  // the toolError below returns with no orphan scan dir (nothing was created).
+  // It must also be listening BEFORE the spawn: the CLI calls /api/versions on
+  // the first attempt (it retries 3x with ~30s gaps, then fatals), and must
+  // not fail on the first attempt.
+  let stub;
+  try {
+    stub = await startEndpointStub();
+  } catch (err) {
+    return toolError(`could not start local endpoint stub: ${err.message}`);
+  }
+  stub.unref();
+  console.error(`qodana-mcp: endpoint stub listening at 127.0.0.1:${stub.address().port} (QODANA_ENDPOINT)`);
+
   const id = scanId();
   const scanDir = path.join(SCANS_DIR, id);
   fs.mkdirSync(path.join(scanDir, 'results'), { recursive: true });
   const profilePath = path.join(scanDir, 'profile.yaml');
   fs.writeFileSync(profilePath, inspectionProfileYaml());
   const logFd = fs.openSync(path.join(scanDir, 'qodana.log'), 'a');
+
+  // QODANA_TOKEN is deliberately stripped from the child env: no cloud
+  // features — the README promises a code-enforced no-token scan.
+  const env = { ...process.env };
+  delete env.QODANA_TOKEN;
+  env.QODANA_ENDPOINT = `http://127.0.0.1:${stub.address().port}`;
+  const warmDist = findWarmDist();
+  if (warmDist) {
+    env.QODANA_DIST = warmDist;
+    console.error(`qodana-mcp: warm IDE dist found, pinning QODANA_DIST=${warmDist} (skips feed HEAD)`);
+  }
+
   const child = spawn('qodana', [
     'scan', '--within-docker', 'false', '--linter', LINTER,
     '--project-dir', projectDir, '--cache-dir', CACHE_DIR,
     '--results-dir', path.join(scanDir, 'results'), '--profile-path', profilePath,
-  ], { detached: true, stdio: ['ignore', logFd, logFd] });
+  ], {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    env,
+  });
   writeStatus(scanDir, {
     state: 'running',
     project_dir: projectDir,
@@ -167,8 +266,14 @@ function startScan(args) {
     startedAt: new Date().toISOString(),
     pid: child.pid,
   });
-  child.on('exit', (exitCode) => finalizeScan(scanDir, { state: exitCode === 0 ? 'done' : 'failed', exitCode, finishedAt: new Date().toISOString() }));
-  child.on('error', (err) => finalizeScan(scanDir, { state: 'failed', exitCode: null, finishedAt: new Date().toISOString(), error: String(err) }));
+  child.on('exit', (exitCode) => {
+    finalizeScan(scanDir, { state: exitCode === 0 ? 'done' : 'failed', exitCode, finishedAt: new Date().toISOString() });
+    stub.close();
+  });
+  child.on('error', (err) => {
+    finalizeScan(scanDir, { state: 'failed', exitCode: null, finishedAt: new Date().toISOString(), error: String(err) });
+    stub.close();
+  });
   child.unref(); // survives the MCP server process; results are read from disk
 
   return json({ scan_id: id, status: 'started' });
