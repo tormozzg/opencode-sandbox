@@ -4,7 +4,7 @@
 //   qodana_findings {scan_id?, files?}       -> compact SARIF-derived findings.
 // Raw SARIF is never returned. No other tools.
 
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -292,8 +292,25 @@ async function startScan(args) {
   const id = scanId();
   const scanDir = path.join(SCANS_DIR, id);
   fs.mkdirSync(path.join(scanDir, 'results'), { recursive: true });
+  const gitignorePatterns = collectGitignorePatterns(projectDir);
   const profilePath = path.join(scanDir, 'profile.yaml');
   fs.writeFileSync(profilePath, inspectionProfileYaml());
+  const scanArgs = [
+    'scan', '--within-docker', 'false', '--linter', LINTER,
+    '--project-dir', projectDir, '--cache-dir', CACHE_DIR,
+    '--results-dir', path.join(scanDir, 'results'), '--profile-path', profilePath,
+  ];
+  if (gitignorePatterns.length > 0) {
+    if (hasProjectQodanaConfig(projectDir)) {
+      // The user's own qodana.yaml wins: --config would replace it, so
+      // degrade to full scope instead of clobbering project settings.
+      console.error('qodana-mcp: project has its own qodana.yaml, gitignore excludes skipped');
+    } else {
+      const configPath = path.join(scanDir, 'qodana-exclude.yaml');
+      fs.writeFileSync(configPath, qodanaExcludeConfigYaml(gitignorePatterns));
+      scanArgs.push('--config', configPath);
+    }
+  }
   const logFd = fs.openSync(path.join(scanDir, 'qodana.log'), 'a');
 
   // QODANA_TOKEN is deliberately stripped from the child env: no cloud
@@ -307,11 +324,7 @@ async function startScan(args) {
     console.error(`qodana-mcp: warm IDE dist found, pinning QODANA_DIST=${warmDist} (skips feed HEAD)`);
   }
 
-  const child = spawn('qodana', [
-    'scan', '--within-docker', 'false', '--linter', LINTER,
-    '--project-dir', projectDir, '--cache-dir', CACHE_DIR,
-    '--results-dir', path.join(scanDir, 'results'), '--profile-path', profilePath,
-  ], {
+  const child = spawn('qodana', scanArgs, {
     detached: true,
     stdio: ['ignore', logFd, logFd],
     env,
@@ -351,6 +364,41 @@ function validateFilesArg(files) {
   return null;
 }
 
+// --- Gitignore-derived ignore patterns --------------------------------------
+// Findings on paths the project's own git ignores (build outputs, vendored
+// code) are noise. Git itself is the source of truth for ignore semantics
+// (nested .gitignores, per-dir excludes) — we never parse .gitignore by hand.
+// `--directory` collapses fully-ignored dirs to "dir/" entries; the trailing
+// slash is stripped because the exclude config matches PLAIN dir paths
+// recursively — the documented "dir/**" glob form is silently NOT honored by
+// v2026.3.1 exclude configs (proven live; plain dirs are).
+
+const GITIGNORE_PATTERN_CAP = 500;
+const GIT_LS_FILES_TIMEOUT_MS = 10_000;
+
+function collectGitignorePatterns(projectDir) {
+  let stdout;
+  try {
+    stdout = execFileSync('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '--directory'], {
+      cwd: projectDir,
+      timeout: GIT_LS_FILES_TIMEOUT_MS,
+      encoding: 'utf8',
+    });
+  } catch (err) {
+    // Not a git repo, git missing, or timeout: degrade to full scan scope.
+    console.error(`qodana-mcp: gitignore ignores: 0 patterns (git ls-files failed: ${String(err.message).split('\n')[0]})`);
+    return [];
+  }
+  const patterns = [...new Set(
+    stdout.split('\n')
+      .map((line) => line.trim())
+      .filter((entry) => entry !== '' && entry !== '/' && entry !== '.')
+      .map((entry) => (entry.endsWith('/') ? entry.slice(0, -1) : entry)),
+  )].sort().slice(0, GITIGNORE_PATTERN_CAP);
+  console.error(`qodana-mcp: gitignore ignores: ${patterns.length} patterns`);
+  return patterns;
+}
+
 function inspectionProfileYaml() {
   const groups = SEMANTIC_GROUPS
     .map((group) => `  - group: "${group}"\n    enabled: true`)
@@ -364,6 +412,33 @@ function inspectionProfileYaml() {
     groups,
     '',
   ].join('\n');
+}
+
+// Git-ignored paths are excluded via a qodana.yaml `exclude` config (name:
+// All = every inspection, paths relative to the project dir) passed to the
+// CLI with --config. PROVEN against v2026.3.1 live scans: (1) per-entry
+// `ignore:` lists in a standalone --profile-path profile file are silently
+// NOT honored (plain paths, "dir/**" globs, and a separate group-ALL ignore
+// entry all left ignored-path findings in the SARIF); (2) the exclude config
+// removes them and keeps the narrow profile intact. --config accepts an
+// absolute path outside the project, so the user's project tree is never
+// modified; exclude paths resolve against the project dir regardless of the
+// server process cwd, and the glob form must be avoided (plain dirs only).
+function qodanaExcludeConfigYaml(patterns) {
+  const quoteYaml = (pattern) => `"${pattern.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+  return [
+    'version: "1.0"',
+    `linter: ${LINTER}`,
+    'exclude:',
+    '  - name: All',
+    '    paths:',
+    ...patterns.map((pattern) => `      - ${quoteYaml(pattern)}`),
+    '',
+  ].join('\n');
+}
+
+function hasProjectQodanaConfig(projectDir) {
+  return ['qodana.yaml', 'qodana.yml'].some((name) => fs.existsSync(path.join(projectDir, name)));
 }
 
 // --- Tool: qodana_findings ---------------------------------------------------

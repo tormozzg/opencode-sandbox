@@ -322,6 +322,12 @@ Behavior notes:
   real v2026.3.1 taxa list), no style checks.
 * The analyzed project must be a git repository — qodana refuses
   non-git projects with "No files to check".
+* Findings exclude the paths the project's own git ignores (build
+  outputs, vendored code): each scan resolves them via
+  `git ls-files --ignored`, which honors all nested `.gitignore` files.
+  With no ignored paths — or git unavailable — the scan keeps its
+  full scope. A project with its own `qodana.yaml` also keeps full
+  scope (the MCP never overrides project config).
 * Scan state persists on disk under `/home/opencode/.cache/qodana/scans/`,
   so findings survive MCP server restarts.
 * Scans resolve Qodana API endpoints against a local stub served by the
