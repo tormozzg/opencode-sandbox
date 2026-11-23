@@ -1,6 +1,6 @@
 {
   "name": "qodana-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Qodana MCP server (stdio): start native-mode Qodana scans and return compact SARIF-derived findings",
   "type": "module",
   "main": "index.js",

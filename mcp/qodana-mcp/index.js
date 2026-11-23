@@ -1,10 +1,20 @@
-// qodana-mcp: stdio MCP server exposing exactly two tools:
+// qodana-mcp: stdio MCP server exposing exactly three tools:
 //   qodana_start_scan {project_dir, files?}  -> launches a detached native-mode
 //      qodana scan (no docker), state lives on disk, returns immediately.
+//   qodana_scan_diff {project_dir, diff_base} -> same, but the CLI runs
+//      --diff-start <diff_base> so only files changed since that commit are
+//      analysed; failure is loud (status failed via qodana_findings), never a
+//      silent fallback to a full scan.
 //   qodana_findings {scan_id?, files?}       -> compact SARIF-derived findings.
 // Raw SARIF is never returned. No other tools.
+// Single-flight is PER PROJECT (one scan per project across all server
+// instances, enforced by a lock file plus the on-disk scan state): concurrent
+// calls for the same project return the running scan's scan_id with
+// already_running:true and owner info and start nothing, while scans of
+// DIFFERENT projects run concurrently with isolated per-project cache dirs.
 
 import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -19,15 +29,37 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 
 const QODANA_ROOT = process.env.QODANA_HOME_DIR ?? '/home/opencode/.cache/qodana';
 const SCANS_DIR = path.join(QODANA_ROOT, 'scans');
-// CACHE_DIR gets an extra "current" level: the qodana CLI computes the IDE
-// dist location as Dir(Dir(--cache-dir)) (compute.go), so with the plain
-// <QODANA_ROOT>/cache the 2.4 GB qodana-QDJVMC-<build>.tar lands one level
-// ABOVE this dir (in ~/.cache), outside the shared container mount. With
-// <QODANA_ROOT>/cache/current, Dir(Dir(...)) = <QODANA_ROOT> = the shared
-// mount, keeping the dist shared across containers.
-const CACHE_DIR = path.join(QODANA_ROOT, 'cache', 'current');
+const LOCKS_DIR = path.join(QODANA_ROOT, 'locks');
 const LINTER = 'qodana-jvm-community';
 const MAX_FINDINGS = 200;
+
+// The cache dir is PER PROJECT: <QODANA_ROOT>/cache/projects/<hash12>/current,
+// hash12 = first 12 hex chars of sha1 of the RESOLVED project dir. The
+// trailing "current" level exists because the qodana CLI computes the IDE
+// dist location as Dir(Dir(--cache-dir)) (compute.go), so with the plain
+// <QODANA_ROOT>/cache the 2.4 GB qodana-QDJVMC-<build>.tar lands one level
+// ABOVE this dir (in ~/.cache), outside the shared container mount;
+// Dir(Dir(cache/projects/<h>/current)) = <QODANA_ROOT>/cache/projects keeps it
+// inside the mount. The projects/<hash12> level exists because a shared
+// cache/current holds single-slot IDE state (idea/263/index,
+// config/263/jdk.table.xml, .idea/workspace.xml) that concurrent scans of
+// different projects would clobber — per-project namespacing inside the IDE
+// cache exists only under idea/263/projects, so the isolation happens at the
+// --cache-dir level. Dist-placement consequence: on a cold start the CLI
+// installs the 2.4 GB dist under <QODANA_ROOT>/cache/projects/ (once, then
+// reused in place); findWarmDist only scans QODANA_ROOT, so a dist at
+// cache/projects/ is not auto-pinned — in the deployed image the dist at
+// QODANA_ROOT is already warm and QODANA_DIST pins it (findWarmDist
+// unchanged). Per-project cache dirs also obsolete the old cross-project
+// .idea scrub: each project's .idea now lives under its own hash dir.
+
+function projectHash12(projectDir) {
+  return crypto.createHash('sha1').update(projectDir).digest('hex').slice(0, 12);
+}
+
+function cacheDirFor(projectDir) {
+  return path.join(QODANA_ROOT, 'cache', 'projects', projectHash12(projectDir), 'current');
+}
 
 // No-DNS hardening: in native mode the CLI resolves the IDE version via a feed
 // HEAD to https://download.jetbrains.com/qodana/feed/<linter>.releases.json
@@ -143,7 +175,8 @@ function finalizeScan(scanDir, patch) {
 
 // A "running" scan whose watcher (the server process) died must not block
 // idempotent start_scan forever: if the qodana pid is gone, finalize from
-// disk evidence (SARIF present -> done, else failed).
+// disk evidence (SARIF present -> done, else failed). The pid check also
+// treats zombies as gone (container init may not reap orphans).
 function reconcile(scanDir) {
   const status = readStatus(scanDir);
   if (status.state !== 'running') return status;
@@ -158,9 +191,157 @@ function isPidAlive(pid) {
   if (pid === null || pid === undefined) return false; // no recorded watcher: rely on disk evidence
   try {
     process.kill(pid, 0);
-    return true;
   } catch (err) {
     return err.code === 'EPERM';
+  }
+  // kill(pid, 0) also succeeds for a zombie: an orphaned qodana child
+  // reparents to container init, which may never reap it, so the zombie
+  // would look "running" forever and block single-flight start. It can
+  // never progress to done, so disk-evidence finalization must win.
+  // /proc format is "State:\tZ (zombie)" — tab after the colon.
+  try {
+    const status = fs.readFileSync(`/proc/${pid}/status`, 'utf8');
+    const stateLine = status.split('\n').find((line) => line.startsWith('State:'));
+    if (stateLine && /^State:\s*Z/.test(stateLine)) return false; // zombie: treat as not alive
+  } catch {
+    // /proc absent or unreadable (e.g. non-linux): fall back to the kill result (alive)
+  }
+  return true;
+}
+
+// --- Per-project scan locks --------------------------------------------------
+// One scan per project across ALL server instances: an atomic lock file per
+// project, <QODANA_ROOT>/locks/<hash12>.lock, acquired after validation and
+// released in the child's exit/error handlers. The payload names the owning
+// scan (scan_id, pid = the SERVER process holding the lock — known at acquire
+// time, unlike the child pid — plus startedAt, project_dir, mode and diff_base
+// when incremental) so a concurrent caller can answer honestly with the
+// running scan's identity. A lock whose owner pid is dead or a zombie, or
+// whose content is unreadable/corrupt, is stealable: a crashed server must not
+// block a project forever. Release re-reads the payload first so a successor's
+// lock is never unlinked by an exiting elder.
+//
+// Content atomicity invariant: a reader sees NO lock or the COMPLETE payload,
+// never a partial file. The payload is written to a unique temp file in the
+// same directory and fs.linkSync then creates the lock name as an atomic
+// exclusive create (EEXIST when taken); readers resolve the hardlink to the
+// already-complete temp content. wx+write is two syscalls and exposes an
+// empty file in between: a racer hitting that window reads null, mistakes the
+// live lock for corrupt, steals it, and two same-project scans would run
+// sharing one per-project cache dir. The temp file lingers only if the
+// process dies between write and link; it is never read.
+//
+// Steal discipline (two-stealer race, observed live as two 'started'
+// responses for one project): a stale lock is unlinked ONLY when the content
+// at unlink time still IS the dead payload just diagnosed — a fresh winner's
+// payload never matches a dead diagnosis, so live locks survive and the
+// unlink storm terminates once the stale generation is gone. A post-win
+// re-read closes the residual read→unlink window: if our brand-new lock was
+// displaced between create and verify, we hold nothing and re-race — exactly
+// one acquirer's payload ends up in the file, and that one proceeds.
+
+function lockPathFor(projectDir) {
+  return path.join(LOCKS_DIR, `${projectHash12(projectDir)}.lock`);
+}
+
+function createLockAtomically(lockPath, lockPayload) {
+  const temp = `${lockPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(lockPayload, null, 2));
+    fs.linkSync(temp, lockPath); // atomic exclusive create: EEXIST when taken
+  } finally {
+    try {
+      fs.unlinkSync(temp); // canonical lock name keeps the content (link count 2→1)
+    } catch {
+      // the temp never existed: the payload write itself failed
+    }
+  }
+}
+
+function readLockFile(lockPath) {
+  try {
+    return JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+  } catch {
+    return null; // unreadable or already unlinked: caller re-races or steals
+  }
+}
+
+// Lock-holder identity: all three fields TOGETHER — scan_id and startedAt are
+// millisecond timestamps that can collide across processes acquiring in the
+// same millisecond (observed live); the holding server's pid cannot.
+function sameLockOwner(a, b) {
+  return a.scan_id === b.scan_id && a.pid === b.pid && a.startedAt === b.startedAt;
+}
+
+// Race rounds before giving up loudly. Convergence needs 2-3 under an
+// 8-instance same-project storm (one steal round for the stale generation,
+// one for an ε-displaced victim); 4 leaves headroom without masking a bug —
+// the terminal throw is unreachable under the protocol itself.
+const LOCK_RACE_ROUNDS = 4;
+
+function acquireProjectLock(projectDir, lockPayload) {
+  fs.mkdirSync(LOCKS_DIR, { recursive: true });
+  const lockPath = lockPathFor(projectDir);
+  for (let round = 0; ; round++) {
+    if (round >= LOCK_RACE_ROUNDS) {
+      // Fail loud rather than answer busy without a real scan_id.
+      throw new Error(`project lock ${lockPath} unresolved after ${LOCK_RACE_ROUNDS} race rounds`);
+    }
+    let taken = false;
+    try {
+      createLockAtomically(lockPath, lockPayload);
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      taken = true;
+    }
+    if (!taken) {
+      // Post-win verification: if our brand-new lock was displaced between
+      // create and this read (ε-window stealer) or vanished, we hold nothing
+      // — re-race; whoever's payload is in the file proceeds, we answer busy
+      // with it.
+      const mine = readLockFile(lockPath);
+      if (mine && sameLockOwner(mine, lockPayload)) return { ok: true, lockPath };
+      continue;
+    }
+    const owner = readLockFile(lockPath);
+    if (owner && isPidAlive(owner.pid)) return { ok: false, owner };
+    if (!owner) {
+      // Absent (vanished mid-race) or unreadable. A protocol lock is never
+      // unreadable (content is complete before the name appears), so this is
+      // free-to-race or foreign garbage: clear it and race again.
+      try {
+        fs.unlinkSync(lockPath);
+      } catch {
+        // already gone
+      }
+      continue;
+    }
+    // Dead owner: steal — but unlink ONLY the exact payload just diagnosed.
+    // Re-read at unlink time: a fresh winner may have appeared between the
+    // read above and here, and deleting its lock would let two same-project
+    // scans run.
+    const atUnlink = readLockFile(lockPath);
+    if (!atUnlink) continue; // vanished: race the create again
+    if (!sameLockOwner(atUnlink, owner)) {
+      if (isPidAlive(atUnlink.pid)) return { ok: false, owner: atUnlink };
+      continue; // a different stale payload: re-diagnose from the top
+    }
+    console.error(`qodana-mcp: stealing stale project lock ${lockPath} (owner pid ${owner.pid} not alive)`);
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // already gone: the next round races the create
+    }
+  }
+}
+
+function releaseProjectLock(lockPath, scanId) {
+  const owner = readLockFile(lockPath);
+  if (!owner || owner.scan_id !== scanId) return; // a successor holds it now
+  try {
+    fs.unlinkSync(lockPath);
+  } catch {
+    // already gone: nothing to release
   }
 }
 
@@ -202,56 +383,30 @@ function startEndpointStub() {
   });
 }
 
-// --- Cross-project IDE-config scrub -----------------------------------------
-// The IDE's saved project config lives in the shared cache at
-// <CACHE_DIR>/.idea/ and is keyed by --cache-dir ONLY, not by project:
-// scanning project B after project A restores A's .idea into B, and the IDE
-// opens B as "already imported", silently skipping B's build-system sync
-// ("No source roots detected" — zero source-file findings; proven
-// bidirectionally Gradle→Maven→Gradle in .opencode/evidence/silent-planet/
-// idea-cache-fix/ — font-libs proved the mechanism only). To keep each scan's project
-// context correct we persist the LAST scanned project_dir in
-// last-project.json on the shared mount (survives server restarts), and when
-// it differs from the project now being scanned delete <CACHE_DIR>/.idea
-// before spawning (a first-ever scan counts as a switch: if .idea does not
-// exist the removal is a no-op, but the marker is still recorded so a later
-// project switch triggers a scrub).
-// The scrub forces one build-system re-sync per project switch — the honest
-// trade-off for correctness; the IDE's warm inspection caches elsewhere in
-// the same cache dir stay, so repeat scans of the SAME project remain fast.
-// Scans are serialized by the running-scan check in startScan, so the scrub
-// never races a live scan of another project (the pre-existing TOCTOU window
-// in that check is unaffected here).
+// --- Tool: qodana_start_scan -------------------------------------------------
+// opts = { mode: 'incremental', diffStart } drives qodana_scan_diff; the
+// default ({}) is the full-project scan. Incremental mode records mode and
+// diff_base in status.json (and in the project lock) so already_running
+// callers can tell what the running scan actually is.
 
-const LAST_PROJECT_FILE = path.join(QODANA_ROOT, 'last-project.json');
-
-function scrubStaleIdeaCache(projectDir) {
-  let last = null;
-  try {
-    last = JSON.parse(fs.readFileSync(LAST_PROJECT_FILE, 'utf8')).project_dir ?? null;
-  } catch {
-    last = null; // no marker yet (first-ever scan) or unreadable: assume a switch
-  }
-  if (last === projectDir) return;
-  const ideaDir = path.join(CACHE_DIR, '.idea');
-  if (fs.existsSync(ideaDir)) {
-    fs.rmSync(ideaDir, { recursive: true });
-    console.error(`qodana-mcp: scrubbed stale IDE project config ${ideaDir} (last scanned: ${last ?? 'none'})`);
-  }
-  try {
-    fs.mkdirSync(QODANA_ROOT, { recursive: true });
-    fs.writeFileSync(LAST_PROJECT_FILE, JSON.stringify({ project_dir: projectDir }));
-  } catch (err) {
-    // Best-effort: a missed marker write only costs one redundant scrub next
-    // time — never fail the scan over it.
-    console.error(`qodana-mcp: could not write ${LAST_PROJECT_FILE}: ${err.message}`);
-  }
+// Honest busy answer for both tools: the caller gets the RUNNING scan's
+// identity instead of a started scan (lock payload or the scan dir's
+// status.json). diff_base appears only when the running scan actually has
+// one. A caller that passed its own scan_id compares it to scan_id here.
+function busyRunningJson(owner) {
+  const payload = {
+    scan_id: owner.scan_id,
+    status: 'running',
+    already_running: true,
+    owner: { pid: owner.pid, startedAt: owner.startedAt },
+    mode: owner.mode ?? 'full',
+  };
+  if (owner.diff_base !== undefined) payload.diff_base = owner.diff_base;
+  return json(payload);
 }
 
-// --- Tool: qodana_start_scan -------------------------------------------------
-
-async function startScan(args) {
-  const invalid = validateStartScanArgs(args);
+async function startScan(args, opts = {}) {
+  const invalid = validateStartScanArgs(args, opts);
   if (invalid) return toolError(invalid);
 
   const projectDir = path.resolve(args.project_dir);
@@ -259,99 +414,137 @@ async function startScan(args) {
     return toolError(`project_dir does not exist or is not a directory: ${projectDir}`);
   }
 
-  const running = listScanDirs().find((dir) => reconcile(dir).state === 'running');
+  const id = scanId();
+  const lockPath = lockPathFor(projectDir);
+  const lockPayload = {
+    scan_id: id,
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    project_dir: projectDir,
+    mode: opts.mode === 'incremental' ? 'incremental' : 'full',
+  };
+  if (opts.mode === 'incremental') lockPayload.diff_base = opts.diffStart;
+
+  // Per-project gate, two sources, in this order: the lock first (atomic), then
+  // the disk scan state (covers a running scan whose lock was lost, e.g. manual
+  // deletion). Both busy paths return without starting anything or creating a
+  // scan dir.
+  const lock = acquireProjectLock(projectDir, lockPayload);
+  if (!lock.ok) return busyRunningJson(lock.owner);
+
+  const running = listScanDirs().find((dir) => {
+    const status = reconcile(dir);
+    return status.state === 'running' && status.project_dir === projectDir;
+  });
   if (running) {
-    return json({ scan_id: path.basename(running), status: 'running', already_running: true });
+    releaseProjectLock(lockPath, id);
+    return busyRunningJson({ ...readStatus(running), scan_id: path.basename(running) });
   }
 
-  // Start the stub BEFORE creating any scan state: if it fails to listen,
-  // the toolError below returns with no orphan scan dir (nothing was created).
-  // It must also be listening BEFORE the spawn: the CLI calls /api/versions on
-  // the first attempt (it retries 3x with ~30s gaps, then fatals), and must
-  // not fail on the first attempt.
+  // Start the stub BEFORE creating any scan state: if it fails to listen, the
+  // toolError below returns with no orphan scan dir (nothing was created) and
+  // the project lock is released. It must also be listening BEFORE the spawn:
+  // the CLI calls /api/versions on the first attempt (it retries 3x with ~30s
+  // gaps, then fatals), and must not fail on the first attempt.
   let stub;
   try {
     stub = await startEndpointStub();
   } catch (err) {
+    releaseProjectLock(lockPath, id);
     return toolError(`could not start local endpoint stub: ${err.message}`);
   }
   stub.unref();
   console.error(`qodana-mcp: endpoint stub listening at 127.0.0.1:${stub.address().port} (QODANA_ENDPOINT)`);
 
-  // AFTER the stub (the only await that can fail — no cache side effects may
-  // precede it) and BEFORE any scan-state creation or the spawn. On a scrub
-  // I/O failure close the stub (mirroring the child handlers) so the throw
-  // cannot leak the listener; marker-write failure-safety stays best-effort.
+  // Scan-state creation and spawn: any failure here (e.g. scan dir creation)
+  // closes the stub, releases the lock, and returns without orphaning either.
   try {
-    scrubStaleIdeaCache(projectDir);
+    const scanDir = path.join(SCANS_DIR, id);
+    fs.mkdirSync(path.join(scanDir, 'results'), { recursive: true });
+    const gitignorePatterns = collectGitignorePatterns(projectDir);
+    const profilePath = path.join(scanDir, 'profile.yaml');
+    fs.writeFileSync(profilePath, inspectionProfileYaml());
+    const scanArgs = [
+      'scan', '--within-docker', 'false', '--linter', LINTER,
+      '--project-dir', projectDir, '--cache-dir', cacheDirFor(projectDir),
+      '--results-dir', path.join(scanDir, 'results'), '--profile-path', profilePath,
+    ];
+    if (gitignorePatterns.length > 0) {
+      if (hasProjectQodanaConfig(projectDir)) {
+        // The user's own qodana.yaml wins: --config would replace it, so
+        // degrade to full scope instead of clobbering project settings.
+        console.error('qodana-mcp: project has its own qodana.yaml, gitignore excludes skipped');
+      } else {
+        const configPath = path.join(scanDir, 'qodana-exclude.yaml');
+        fs.writeFileSync(configPath, qodanaExcludeConfigYaml(gitignorePatterns));
+        scanArgs.push('--config', configPath);
+      }
+    }
+    if (opts.mode === 'incremental') {
+      scanArgs.push('--diff-start', opts.diffStart);
+    }
+    const logFd = fs.openSync(path.join(scanDir, 'qodana.log'), 'a');
+
+    // QODANA_TOKEN is deliberately stripped from the child env: no cloud
+    // features — the README promises a code-enforced no-token scan.
+    const env = { ...process.env };
+    delete env.QODANA_TOKEN;
+    env.QODANA_ENDPOINT = `http://127.0.0.1:${stub.address().port}`;
+    const warmDist = findWarmDist();
+    if (warmDist) {
+      env.QODANA_DIST = warmDist;
+      console.error(`qodana-mcp: warm IDE dist found, pinning QODANA_DIST=${warmDist} (skips feed HEAD)`);
+    }
+
+    const child = spawn('qodana', scanArgs, {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env,
+    });
+    const statusPayload = {
+      state: 'running',
+      project_dir: projectDir,
+      files: args.files ?? [],
+      startedAt: new Date().toISOString(),
+      pid: child.pid,
+    };
+    if (opts.mode === 'incremental') {
+      statusPayload.mode = 'incremental';
+      statusPayload.diff_base = opts.diffStart;
+    }
+    writeStatus(scanDir, statusPayload);
+    child.on('exit', (exitCode) => {
+      finalizeScan(scanDir, { state: exitCode === 0 ? 'done' : 'failed', exitCode, finishedAt: new Date().toISOString() });
+      releaseProjectLock(lockPath, id);
+      stub.close();
+    });
+    child.on('error', (err) => {
+      finalizeScan(scanDir, { state: 'failed', exitCode: null, finishedAt: new Date().toISOString(), error: String(err) });
+      releaseProjectLock(lockPath, id);
+      stub.close();
+    });
+    child.unref(); // survives the MCP server process; results are read from disk
   } catch (err) {
     stub.close();
-    return toolError(`could not scrub stale IDE project config: ${err.message}`);
+    releaseProjectLock(lockPath, id);
+    return toolError(`could not start qodana scan: ${err.message}`);
   }
 
-  const id = scanId();
-  const scanDir = path.join(SCANS_DIR, id);
-  fs.mkdirSync(path.join(scanDir, 'results'), { recursive: true });
-  const gitignorePatterns = collectGitignorePatterns(projectDir);
-  const profilePath = path.join(scanDir, 'profile.yaml');
-  fs.writeFileSync(profilePath, inspectionProfileYaml());
-  const scanArgs = [
-    'scan', '--within-docker', 'false', '--linter', LINTER,
-    '--project-dir', projectDir, '--cache-dir', CACHE_DIR,
-    '--results-dir', path.join(scanDir, 'results'), '--profile-path', profilePath,
-  ];
-  if (gitignorePatterns.length > 0) {
-    if (hasProjectQodanaConfig(projectDir)) {
-      // The user's own qodana.yaml wins: --config would replace it, so
-      // degrade to full scope instead of clobbering project settings.
-      console.error('qodana-mcp: project has its own qodana.yaml, gitignore excludes skipped');
-    } else {
-      const configPath = path.join(scanDir, 'qodana-exclude.yaml');
-      fs.writeFileSync(configPath, qodanaExcludeConfigYaml(gitignorePatterns));
-      scanArgs.push('--config', configPath);
-    }
+  if (opts.mode === 'incremental') {
+    return json({ scan_id: id, status: 'started', mode: 'incremental', diff_base: opts.diffStart });
   }
-  const logFd = fs.openSync(path.join(scanDir, 'qodana.log'), 'a');
-
-  // QODANA_TOKEN is deliberately stripped from the child env: no cloud
-  // features — the README promises a code-enforced no-token scan.
-  const env = { ...process.env };
-  delete env.QODANA_TOKEN;
-  env.QODANA_ENDPOINT = `http://127.0.0.1:${stub.address().port}`;
-  const warmDist = findWarmDist();
-  if (warmDist) {
-    env.QODANA_DIST = warmDist;
-    console.error(`qodana-mcp: warm IDE dist found, pinning QODANA_DIST=${warmDist} (skips feed HEAD)`);
-  }
-
-  const child = spawn('qodana', scanArgs, {
-    detached: true,
-    stdio: ['ignore', logFd, logFd],
-    env,
-  });
-  writeStatus(scanDir, {
-    state: 'running',
-    project_dir: projectDir,
-    files: args.files ?? [],
-    startedAt: new Date().toISOString(),
-    pid: child.pid,
-  });
-  child.on('exit', (exitCode) => {
-    finalizeScan(scanDir, { state: exitCode === 0 ? 'done' : 'failed', exitCode, finishedAt: new Date().toISOString() });
-    stub.close();
-  });
-  child.on('error', (err) => {
-    finalizeScan(scanDir, { state: 'failed', exitCode: null, finishedAt: new Date().toISOString(), error: String(err) });
-    stub.close();
-  });
-  child.unref(); // survives the MCP server process; results are read from disk
-
   return json({ scan_id: id, status: 'started' });
 }
 
-function validateStartScanArgs(args) {
+function validateStartScanArgs(args, opts = {}) {
   if (typeof args.project_dir !== 'string' || args.project_dir.length === 0) {
     return 'project_dir is required and must be a string (absolute path).';
+  }
+  if (opts.mode === 'incremental') {
+    if (typeof opts.diffStart !== 'string' || opts.diffStart.length === 0) {
+      return 'diff_base is required and must be a non-empty string (commit to diff from).';
+    }
+    return null;
   }
   return validateFilesArg(args.files);
 }
@@ -495,13 +688,13 @@ function respondForScan(scanDir, files) {
 
 // --- MCP wiring --------------------------------------------------------------
 
-const server = new Server({ name: 'qodana-mcp', version: '0.1.0' }, { capabilities: { tools: {} } });
+const server = new Server({ name: 'qodana-mcp', version: '0.2.0' }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'qodana_start_scan',
-      description: 'Start a Qodana (JetBrains) static analysis scan on a project directory in native mode. Returns scan_id immediately; polls via qodana_findings. Idempotent: if a scan is already running, its scan_id is returned with already_running: true.',
+      description: 'Start a Qodana (JetBrains) static analysis scan on a project directory in native mode. Returns scan_id immediately; polls via qodana_findings. Single-flight is per project across all server instances: if a scan of the SAME project is already running, its scan_id is returned with already_running: true and owner info (pid, startedAt) and nothing is started; scans of DIFFERENT projects run concurrently with isolated per-project cache dirs.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -522,6 +715,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: 'qodana_scan_diff',
+      description: 'Start a Qodana scan limited to the files changed since diff_base (a commit, passed to the CLI as --diff-start). Same lifecycle and per-project single-flight as qodana_start_scan: if a scan of the SAME project is already running, its scan_id is returned with already_running: true, owner info (pid, startedAt), and the running scan\'s mode (plus diff_base when the running scan is itself a diff scan) — the diff scan is NOT started.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          project_dir: { type: 'string', description: 'Absolute path to the project directory to analyze' },
+          diff_base: { type: 'string', description: 'Commit to diff from (e.g. HEAD~1); only files changed since it are analysed' },
+        },
+        required: ['project_dir', 'diff_base'],
+      },
+    },
   ],
 }));
 
@@ -529,6 +734,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments ?? {};
   if (request.params.name === 'qodana_start_scan') return startScan(args);
   if (request.params.name === 'qodana_findings') return getFindings(args);
+  if (request.params.name === 'qodana_scan_diff') {
+    return startScan(args, { mode: 'incremental', diffStart: args.diff_base });
+  }
   return toolError(`Unknown tool: ${request.params.name}`);
 });
 

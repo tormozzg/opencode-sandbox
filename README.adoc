@@ -281,12 +281,27 @@ Run it in the TUI as `/lint`.
 == Qodana MCP
 
 The image ships a Qodana MCP server at `/opt/qodana-mcp` (node, SDK-based)
-that exposes two tools for deep semantic analysis:
+that exposes three tools for deep semantic analysis:
 
 * `qodana_start_scan(project_dir, files?)` — starts a background scan and
-  returns `{scan_id, status:"started"}`. Idempotent: while a scan is
-  already active it returns that scan's id instead of starting a second
-  one.
+  returns `{scan_id, status:"started"}`. Single-flight is per project:
+  while a scan of the SAME project is already running it returns that
+  scan's id with `already_running:true` and owner info (`pid`,
+  `startedAt`) instead of starting a second one; scans of different
+  projects run concurrently.
+* `qodana_scan_diff(project_dir, diff_base)` — same lifecycle and
+  per-project single-flight as `qodana_start_scan`, but the scan covers
+  only the files changed since `diff_base` (a commit, e.g. `HEAD~1`;
+  passed to the CLI as `--diff-start`). Returns `{scan_id,
+  status:"started", mode:"incremental", diff_base}`; while a scan of the
+  same project is running it returns that scan's id with
+  `already_running:true`, owner info, and the running scan's `mode`
+  (plus its `diff_base` when the running scan is itself a diff scan),
+  without starting a second one. Read the results through the same
+  `qodana_findings` — there is no second findings channel. A bad
+  `diff_base` or a CLI failure surfaces loudly as `{status:"failed"}`
+  from `qodana_findings`; the server never falls back to a full scan
+  silently.
 * `qodana_findings(scan_id?, files?)` — returns `"running"` while the scan
   is in progress, or compact findings as `{file, line, severity, rule,
   message}` once it completes. Without a `scan_id` it reports the last
@@ -311,6 +326,18 @@ Enable it in the HOST config `~/opencode/sandbox/config/opencode.jsonc`
 
 Behavior notes:
 
+* Scans are single-flighted PER PROJECT across all server instances: a
+  lock file under `/home/opencode/.cache/qodana/locks/<project-hash>.lock`
+  plus the on-disk scan state enforce one scan per project. A second call
+  for the same project returns the running scan's `scan_id`,
+  `already_running:true` and `owner:{pid, startedAt}` — nothing is
+  started. Concurrent scans of DIFFERENT projects are allowed: each gets
+  its own cache dir under
+  `/home/opencode/.cache/qodana/cache/projects/<project-hash>/current`,
+  so the IDE state a shared cache would let concurrent scans clobber
+  (indexes, SDK table, `.idea` config) is per project. A stale lock
+  whose owner process is gone (crashed server) is stolen by the next
+  caller.
 * Runs the `qodana` CLI in native mode, so no docker is needed inside the
   container.
 * The scan cache is shared across containers via the new oc-sand-stateful
