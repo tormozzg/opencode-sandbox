@@ -32,6 +32,11 @@ shift
 PROJECT_NAME="$(basename "$PWD")"
 CONTAINER="oc-sand-${PROJECT_NAME}"
 
+# Physical path of the project on the host (symlinks resolved, so e.g.
+# macOS /tmp -> /private/tmp does not break path parity). Used below to
+# mount the project into the container at the same absolute path.
+PROJECT_DIR="$(pwd -P)"
+
 # Shared docker network so the sandbox container can reach the MCP
 # servers attached to it.
 NETWORK="mcp-shared-network"
@@ -59,8 +64,16 @@ OS="$(uname -s)"
 mkdir -p "$HOME/opencode/sandbox/qodana"
 
 # Shared docker flags (same mounts/env as the previous ephemeral runner).
+# The project dir is mounted at the SAME absolute path it has on the host,
+# and -w below points at that path, so host and sandbox paths always match.
+# git worktree depends on this: its .git file and the .git/worktrees
+# entries store absolute host paths, which only resolve inside the sandbox
+# when the paths are identical. Note: existing stateful containers keep
+# the configuration they were created with (the old fixed mount of ./ at
+# a container-internal path) — run wipe-data once to recreate the
+# container with matching paths.
 DOCKER_FLAGS=(
-	-v ./:/workspace
+	-v "$PROJECT_DIR:$PROJECT_DIR"
 	-v ~/opencode/sandbox/data:/home/opencode/.local/share/opencode
 	-v ~/opencode/sandbox/state:/home/opencode/.local/state/opencode
 	-v ~/opencode/sandbox/config:/home/opencode/.config/opencode
@@ -100,7 +113,10 @@ else
 fi
 
 DOCKER_FLAGS+=(
-	-w /workspace
+	# Same path as the host project dir (see DOCKER_FLAGS above): git
+	# worktree stores absolute host paths, and a matching working dir
+	# keeps them valid inside the sandbox.
+	-w "$PROJECT_DIR"
 	-e OPENCODE_EXPERIMENTAL_PLAN_MODE=1
 	-e TESTCONTAINERS_HOST_OVERRIDE=host.docker.internal
 	--add-host=host.docker.internal:host-gateway

@@ -70,6 +70,12 @@ sessions.
 Pass the image you built with `build-image.sh` as the first argument; the
 script has no hardcoded default image.
 
+Path parity: the project directory is mounted into the container at the same
+absolute path as on the host, and the container's working directory is that
+same path — host and sandbox paths match, which git worktree requires (its
+`.git` files store absolute host paths). Existing containers keep their
+creation-time configuration: run `wipe-data` once after updating the script.
+
 Container naming:
 
 * The container is named `oc-sand-<project>`, where `<project>` is the
