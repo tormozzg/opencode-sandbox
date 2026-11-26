@@ -453,3 +453,116 @@ Save it (e.g. as `~/bin/oc-sand-jdk25`), make it executable with
 script. The wrapper assumes `oc-sand-stateful` is on your `PATH` (e.g.
 installed in `~/.local/bin`).
 
+
+== GUI desktop & VNC (optional)
+
+The image contains a full XFCE desktop on a virtual X server (Xvfb on
+display `:99`). It is started by the in-image `oc-sand-desktop` script only
+when the container is created with `OC_SAND_GUI=1`; without it the sandbox
+behaves exactly as before (no ports published, no desktop processes). The
+desktop is shared: VNC shows the SAME display the agents and `docker exec`
+sessions (which get `DISPLAY=:99` from the image) work on.
+
+Enable it when creating the container:
+
+[source, bash]
+----
+OC_SAND_GUI=1 ./oc-sand-stateful <image-name>
+----
+
+Connect from the host with any VNC client:
+
+* *View-only* (no input): `127.0.0.1:15901` (container port 5900)
+* *Full control* (keyboard + mouse): `127.0.0.1:15902` (container port 5901)
+
+Both listeners authenticate with one VNC password, default `sandvnc1`.
+Override it with `OC_SAND_VNC_PASSWORD` before the container is created:
+
+[source, bash]
+----
+OC_SAND_GUI=1 OC_SAND_VNC_PASSWORD='my-secret' ./oc-sand-stateful <image-name>
+----
+
+Note: x11vnc's rfbauth truncates passwords to 8 characters — a longer
+password is silently cut to its first 8 characters, so the effective
+password is the first 8 characters of what you set.
+
+=== Recreation requirement
+
+Like all extra flags, the GUI ports only take effect when the container is
+first created. An EXISTING stateful container must be recreated to gain
+them:
+
+[source, bash]
+----
+./oc-sand-stateful <image-name> wipe-data
+OC_SAND_GUI=1 ./oc-sand-stateful <image-name>
+----
+
+WARNING: recreation loses container-internal state that is not in a host
+mount — packages installed at runtime, files under unmounted paths — the
+same caveat as after every image rebuild.
+
+=== Security notes
+
+* The VNC ports are published on the host loopback (`127.0.0.1`) only: the
+  desktop is not LAN-reachable by default.
+* *Container-side source restriction*: both x11vnc listeners accept
+  connections ONLY from in-container loopback plus the docker bridge
+  gateway IP (the source address host-originated connections arrive
+  with), so sibling containers on `mcp-shared-network` are refused by
+  default.
+* `OC_SAND_VNC_ALLOW` override: when set (and non-empty), its value is
+  passed as the `-allow` argument to BOTH listeners; broadening it
+  reopens sibling-container reachability and deliberately suspends the
+  fail-closed safeguard — set it only with a specific reason.
+* The source restriction is baked into the image: existing GUI containers
+  keep unrestricted listeners until image rebuild AND container
+  recreation.
+* Fail-closed: if the gateway IP cannot be determined, NEITHER VNC
+  listener starts (the desktop itself still runs). Symptom -> cause ->
+  remedy: the VNC ports refuse connections or show no banner -> the
+  gateway IP could not be determined -> check
+  `/tmp/oc-sand-desktop/starter.log` -> for exotic setups set
+  `OC_SAND_VNC_ALLOW`.
+* `-allow` is a network ACL, not authentication or identity — the VNC
+  password (above) remains the only authentication on both listeners.
+* The VNC password is authentication, not transport security; the
+  connection is not encrypted. Tunnel it (e.g. `ssh -L`) if it ever leaves
+  the machine.
+* Publishing to the LAN is a deliberate flag change: override the loopback
+  `-p` flags via `OC_SAND_EXTRA_FLAGS` (see the "Extra docker flags:
+  OC_SAND_EXTRA_FLAGS" section above) — do not do it casually.
+* x11vnc syncs the clipboard by default, which makes VNC a two-way
+  host<->desktop data channel: what an agent copies can reach the host and
+  vice versa.
+* The desktop container already holds the host docker.sock, so anyone with
+  full desktop control is effectively host-root. Grant control access
+  (port 15902) to trusted parties only; view-only (15901) is the safe
+  default for everyone else.
+
+=== Concurrent GUI sandboxes
+
+The fixed host ports serve ONE GUI sandbox at a time. A second concurrent
+GUI project publishes alternate host ports via the raw `OC_SAND_EXTRA_FLAGS`
+variable (which composes with everything above) plus the desktop env:
+
+[source, bash]
+----
+OC_SAND_EXTRA_FLAGS="-e OC_SAND_DESKTOP=1 -e OC_SAND_VNC_PASSWORD='my-secret' -p 127.0.0.1:15911:5900 -p 127.0.0.1:15912:5901" ./oc-sand-stateful <image-name>
+----
+
+The same variable is how you forward the VNC password: a password set via
+`OC_SAND_VNC_PASSWORD` on the host reaches the desktop script only if you also
+pass `-e OC_SAND_VNC_PASSWORD=...` here — otherwise it silently falls back to
+the `sandvnc1` default.
+
+=== Rollback
+
+* *Runtime*: recreate the container without `OC_SAND_GUI` — that is exactly
+  the previous behavior (the GUI packages stay installed in the image but
+  are inert: nothing starts them, no ports are published).
+* *Full removal*: `git revert` the four changed/new product files
+  (`Dockerfile`, `entrypoint.sh`, `oc-sand-stateful`, `oc-sand-desktop`)
+  and rebuild the image.
+

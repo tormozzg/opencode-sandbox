@@ -37,12 +37,30 @@ ENV SKIP_EGRESS_FIREWALL="true"
 
 RUN rm -rf /var/lib/apt/lists/*
 
+# Optional GUI desktop stack: Xvfb (display :99) + x11vnc (VNC servers) +
+# the xfce4 desktop incl. dbus-x11; started by /usr/local/bin/oc-sand-desktop
+# only when OC_SAND_DESKTOP=1, so everything here is inert without the
+# desktop. procps provides pgrep for the starter's idempotency check.
+# iproute2 provides the `ip` binary the starter uses to detect the docker
+# bridge gateway IP for the x11vnc -allow source restriction — this image
+# is built --no-install-recommends and has no `ip` binary without it, so
+# gateway detection would fail closed on every boot. The apt lists were
+# removed above, so this layer updates them itself.
+RUN apt-get update && apt-get install --no-install-recommends -y xvfb x11vnc dbus-x11 xauth procps iproute2 xfce4 thunar xfce4-terminal
+
 USER opencode
 
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
+COPY --chmod=0755 oc-sand-desktop /usr/local/bin/oc-sand-desktop
 ENTRYPOINT [ "/entrypoint.sh" ]
 
 SHELL ["/bin/bash", "-c"]
+
+# The single DISPLAY mechanism (GUI plan, resolved decision 9): docker exec
+# sessions do not run the entrypoint, so the desktop DISPLAY=:99 has to come
+# from the image ENV. It is inert without the desktop: no X server listens
+# on :99 unless oc-sand-desktop started one.
+ENV DISPLAY=:99
 
 ENV JAVA_HOME="/home/opencode/.sdkman/candidates/java/current"
 ENV OPENCODE_PATH="/home/opencode/.opencode/bin"

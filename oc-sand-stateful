@@ -129,6 +129,20 @@ if [[ -n "${OC_SAND_EXTRA_FLAGS:-}" ]]; then
 	read -r -a EXTRA_FLAGS <<< "$OC_SAND_EXTRA_FLAGS"
 fi
 
+# Optional GUI desktop: with OC_SAND_GUI=1 the container gets
+# OC_SAND_DESKTOP=1 (entrypoint.sh then starts the desktop) and the two VNC
+# listeners are published on the host loopback (view-only 15901 -> container
+# 5900, full-control 15902 -> container 5901). Like all EXTRA_FLAGS this
+# only applies when the container is first created; the VNC password is
+# passed through only when set (the starter defaults to sandvnc1).
+if [[ "${OC_SAND_GUI:-}" == "1" ]]; then
+	EXTRA_FLAGS+=( -e OC_SAND_DESKTOP=1 )
+	if [[ -n "${OC_SAND_VNC_PASSWORD:-}" ]]; then
+		EXTRA_FLAGS+=( -e OC_SAND_VNC_PASSWORD="$OC_SAND_VNC_PASSWORD" )
+	fi
+	EXTRA_FLAGS+=( -p 127.0.0.1:15901:5900 -p 127.0.0.1:15902:5901 )
+fi
+
 # Ensure the shared docker network exists; created once, silently kept
 # if already present. Called before any path that creates or starts the
 # container (wipe-data exits earlier and never needs the network).
