@@ -525,6 +525,11 @@ same caveat as after every image rebuild.
   gateway IP could not be determined -> check
   `/tmp/oc-sand-desktop/starter.log` -> for exotic setups set
   `OC_SAND_VNC_ALLOW`.
+* Desktop fails to start after a container restart: stale X artifacts are
+  now cleaned automatically on the next start (see
+  `/tmp/oc-sand-desktop/starter.log`). If an older image is in use, remove
+  `/tmp/.X99-lock` and `/tmp/.X11-unix/X99` inside the container and
+  start the desktop again.
 * `-allow` is a network ACL, not authentication or identity — the VNC
   password (above) remains the only authentication on both listeners.
 * The VNC password is authentication, not transport security; the

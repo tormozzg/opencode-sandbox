@@ -15,6 +15,16 @@ fi
 
 mkdir -p "$LOG_DIR"
 
+# Container stop tears Xvfb down via cgroup SIGKILL, which leaves the
+# display lock and socket files behind, and /tmp persists across
+# stop/start — without removing them Xvfb refuses to start with
+# "Server is already active for display 99". This code is only reached
+# when no live Xvfb was found above, so nothing running loses its
+# artifacts here.
+echo "removing stale X artifacts: /tmp/.X99-lock /tmp/.X11-unix/X99"
+rm -f /tmp/.X99-lock
+rm -f /tmp/.X11-unix/X99
+
 # Software-rendered X server for the desktop; -nolisten tcp keeps it on the
 # container-local unix socket only.
 Xvfb :99 -screen 0 "${OC_SAND_DESKTOP_GEOMETRY:-1600x900x24}" -nolisten tcp &
